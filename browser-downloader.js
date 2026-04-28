@@ -194,90 +194,103 @@ async function deleteProfile(profileId) {
   }
 }
 
-// Track a download triggered by the next user action.
-// Must be called BEFORE the click that triggers the download so listeners
-// are attached in time. Returns { wait } — call wait() after the click to
-// resolve with { filename } on success or throw on failure.
+// Snapshot non-hidden files in a directory.
+async function snapshotDir(dir) {
+  try {
+    const entries = await fs.readdir(dir);
+    return new Set(entries.filter((f) => !f.startsWith('.')));
+  } catch {
+    return new Set();
+  }
+}
+
+// Track a download by watching the download directory on disk. CDP download
+// events (Page.downloadWillBegin / Browser.downloadWillBegin) don't fire
+// reliably across all Chromium builds — particularly the Mimic browser used
+// by Multilogin — so we trust the filesystem instead. Must be created BEFORE
+// the click that triggers the download so the "before" snapshot is accurate.
 //
 // Failure modes detected:
-//   - Download never starts within `startTimeout` (e.g. Freepik shows the
+//   - No new file appears within `startTimeout` (e.g. Freepik showed the
 //     "upgrade to plan" modal instead of serving the file).
-//   - Download starts but is canceled.
-//   - Download starts but doesn't complete within `completeTimeout`.
-//   - Download reports complete but no file ended up on disk.
-function trackDownload(client, downloadDir, { startTimeout = 15000, completeTimeout = CONFIG.DOWNLOAD_TIMEOUT } = {}) {
-  let downloadGuid = null;
-  let suggestedFilename = null;
-  let resolveStarted;
-  let resolveFinished;
-  let rejectFinished;
+//   - A new file appeared but never reached a stable, non-temp state within
+//     `completeTimeout` (download hung or aborted mid-way).
+async function trackDiskDownload(downloadDir, {
+  startTimeout = 20000,
+  completeTimeout = CONFIG.DOWNLOAD_TIMEOUT,
+  stableMs = 1500,
+  pollMs = 400,
+} = {}) {
+  const before = await snapshotDir(downloadDir);
+  const isTemp = (f) => /\.(crdownload|part|tmp)$/i.test(f);
 
-  const startedPromise = new Promise((r) => { resolveStarted = r; });
-  const finishedPromise = new Promise((res, rej) => { resolveFinished = res; rejectFinished = rej; });
-
-  const willBeginHandler = (event) => {
-    downloadGuid = event.guid;
-    suggestedFilename = event.suggestedFilename;
-    console.log(`    → Download started: ${suggestedFilename}`);
-    resolveStarted();
+  const newEntries = async () => {
+    const now = await snapshotDir(downloadDir);
+    return [...now].filter((f) => !before.has(f));
   };
-
-  const progressHandler = (event) => {
-    if (downloadGuid && event.guid !== downloadGuid) return;
-    if (event.state === 'completed') {
-      cleanup();
-      resolveFinished({ filename: suggestedFilename });
-    } else if (event.state === 'canceled') {
-      cleanup();
-      rejectFinished(new Error('Download canceled by browser (likely premium/paywall block)'));
-    }
-  };
-
-  const cleanup = () => {
-    client.off('Page.downloadWillBegin', willBeginHandler);
-    client.off('Page.downloadProgress', progressHandler);
-  };
-
-  client.on('Page.downloadWillBegin', willBeginHandler);
-  client.on('Page.downloadProgress', progressHandler);
 
   return {
     async wait() {
-      try {
-        // Phase 1: download must actually start. If it doesn't, the page
-        // probably showed an upgrade prompt rather than serving a file.
-        await Promise.race([
-          startedPromise,
-          new Promise((_, rej) => setTimeout(
-            () => rej(new Error('Download never started — likely "upgrade to plan" modal')),
-            startTimeout
-          )),
-        ]);
+      const startDeadline = Date.now() + startTimeout;
+      const completeDeadline = Date.now() + completeTimeout;
+      let activityLogged = false;
 
-        // Phase 2: started download must complete.
-        const result = await Promise.race([
-          finishedPromise,
-          new Promise((_, rej) => setTimeout(
-            () => rej(new Error('Download started but did not complete in time')),
-            completeTimeout
-          )),
-        ]);
+      while (Date.now() < completeDeadline) {
+        const seen = await newEntries();
 
-        // Phase 3: belt-and-braces — verify the file actually landed on disk.
-        if (result.filename) {
-          const filePath = path.join(downloadDir, result.filename);
-          try {
-            const stat = await fs.stat(filePath);
-            if (stat.size === 0) throw new Error('Downloaded file is empty');
-          } catch (err) {
-            throw new Error(`Download reported complete but file missing on disk: ${err.message}`);
+        if (seen.length === 0) {
+          if (Date.now() >= startDeadline) {
+            throw new Error('Download never started — likely "upgrade to plan" modal');
           }
+          await sleep(pollMs);
+          continue;
         }
 
-        return result;
-      } finally {
-        cleanup();
+        if (!activityLogged) {
+          activityLogged = true;
+          console.log(`    → Disk activity detected: ${seen.join(', ')}`);
+        }
+
+        const finals = seen.filter((f) => !isTemp(f));
+        if (finals.length === 0) {
+          // Only temp files so far — still downloading.
+          await sleep(pollMs);
+          continue;
+        }
+
+        // Pick the most recently modified final file as our candidate.
+        const stats = await Promise.all(finals.map(async (f) => {
+          const s = await fs.stat(path.join(downloadDir, f));
+          return { name: f, size: s.size, mtime: s.mtimeMs };
+        }));
+        stats.sort((a, b) => b.mtime - a.mtime);
+        const pick = stats[0];
+
+        if (pick.size === 0) {
+          await sleep(pollMs);
+          continue;
+        }
+
+        // Stability check: wait stableMs, then verify size is unchanged AND
+        // no temp file is still in flight before declaring success.
+        await sleep(stableMs);
+        const stillInProgress = (await newEntries()).some(isTemp);
+        if (stillInProgress) continue;
+
+        try {
+          const after = await fs.stat(path.join(downloadDir, pick.name));
+          if (after.size === pick.size && after.size > 0) {
+            return { filename: pick.name, size: after.size };
+          }
+        } catch {
+          // File renamed or moved between checks — keep polling.
+        }
       }
+
+      if (!activityLogged) {
+        throw new Error('Download never started — likely "upgrade to plan" modal');
+      }
+      throw new Error('Download started but did not complete in time');
     },
   };
 }
@@ -377,17 +390,18 @@ async function downloadBatch(urls, proxy, batchIndex, totalBatches) {
         console.log(`    ✓ Found ${downloadLinks.length} download options`);
         console.log(`    → Clicking 2nd download option...`);
 
-        // Step 4: Attach download listeners BEFORE clicking, then click and wait
-        // for an actual completed download. If Freepik shows an "upgrade to plan"
-        // modal instead of serving the file, no download event fires and this
-        // throws, leaving the URL out of successful_urls.txt for retry.
+        // Step 4: Snapshot the download dir BEFORE clicking, then click and
+        // watch the filesystem for the new file to appear and stabilize. If
+        // Freepik shows an "upgrade to plan" modal instead of serving the
+        // file, no new file appears and this throws, leaving the URL out of
+        // successful_urls.txt so it gets retried on the next run.
         const downloadDir = path.resolve(CONFIG.IMAGES_DIR);
-        const tracker = trackDownload(client, downloadDir);
+        const tracker = await trackDiskDownload(downloadDir);
         await downloadLinks[1].click();
-        console.log(`    ✓ Download click sent, waiting for completion...`);
+        console.log(`    ✓ Download click sent, watching ${CONFIG.IMAGES_DIR}/ for new file...`);
 
         const downloadResult = await tracker.wait();
-        console.log(`    ✅ Download verified: ${downloadResult.filename || '(file saved)'}`);
+        console.log(`    ✅ Download verified: ${downloadResult.filename} (${(downloadResult.size / 1024).toFixed(1)} KB)`);
 
         // Mark as successful only after verified completion
         await saveSuccessfulUrl(url);

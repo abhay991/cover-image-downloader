@@ -416,12 +416,22 @@ async function downloadBatch(urls, proxy, batchIndex, totalBatches) {
         console.log(`    ❌ Failed: ${error.message}`);
         failCount++;
 
-        // Small delay before continuing to next URL even on error
-        await sleep(1000);
+        // Abort the rest of the batch and let the finally block tear down
+        // the profile. The worker will then pick up the next batch with a
+        // fresh profile and a different proxy. Rationale: the most common
+        // failure here is Freepik's "upgrade to plan" modal, which means
+        // this proxy/profile has been flagged for the paywall — burning
+        // more clicks on it just wastes time. Untouched URLs stay out of
+        // successful_urls.txt and get retried on the next run.
+        const skipped = urls.length - (i + 1);
+        if (skipped > 0) {
+          console.log(`    🔄 Aborting batch — ${skipped} URL(s) will retry with a fresh profile`);
+        }
+        break;
       }
     }
 
-    console.log(`\n  📊 Batch complete: ${successCount} succeeded, ${failCount} failed`);
+    console.log(`\n  📊 Batch ended: ${successCount} succeeded, ${failCount} failed`);
 
     // Delay after batch if configured
     if (CONFIG.BATCH_DELAY > 0) {

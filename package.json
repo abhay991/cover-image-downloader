@@ -1,0 +1,17 @@
+{
+  "name": "image-downloader",
+  "version": "1.0.0",
+  "description": "Browser-based Freepik image downloader using Multilogin",
+  "main": "browser-downloader.js",
+  "type": "module",
+  "scripts": {
+    "start": "node browser-downloader.js"
+  },
+  "keywords": ["scraper", "downloader", "freepik", "multilogin"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "puppeteer-core": "^23.10.4",
+    "dotenv": "^16.4.7"
+  }
+}

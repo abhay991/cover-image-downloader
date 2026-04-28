@@ -1,0 +1,26 @@
+# Environment variables
+.env
+.env.*
+
+# Credentials / config with secrets
+proxies.txt
+
+# Dependencies
+node_modules/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Downloaded images
+images/
+
+# Generated files
+successful_urls.txt
+
+# Local backups / snapshots
+Archive.zip

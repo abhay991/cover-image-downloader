@@ -13,8 +13,7 @@ const CONFIG = {
   URLS_FILE: 'urls.json',
   SUCCESS_LOG: 'successful_urls.txt',
   IMAGES_DIR: 'images',
-  BATCH_SIZE: parseInt(process.env.BATCH_SIZE || '10'), // Number of images to download per browser session
-  BATCH_DELAY: parseInt(process.env.BATCH_DELAY || '5'), // Delay in seconds after each batch
+  BATCH_DELAY: parseInt(process.env.BATCH_DELAY || '5'), // Delay in seconds between profile rotations
 
   // Multilogin configuration
   MULTILOGIN_API_KEY: process.env.MULTILOGIN_API_KEY || '', // Your Multilogin API key from .env
@@ -295,10 +294,13 @@ async function trackDiskDownload(downloadDir, {
   };
 }
 
-// Download images from a batch of URLs
-async function downloadBatch(urls, proxy, batchIndex, totalBatches) {
+// Spin up one Multilogin profile and pull URLs from the shared queue until
+// the profile gets paywalled (or the queue empties). On failure, the URL
+// that triggered it is dropped for this run — it stays out of
+// successful_urls.txt and will be retried the next time the script runs.
+async function downloadWithProfile(urlQueue, proxy, profileLabel, results) {
   const timestamp = new Date().toISOString().split('T')[1].split('.')[0];
-  console.log(`\n[${timestamp}] [Batch ${batchIndex + 1}/${totalBatches}] Processing ${urls.length} URLs with proxy: ${proxy.split(':')[0]}:${proxy.split(':')[1]}`);
+  console.log(`\n[${timestamp}] [Profile ${profileLabel}] Spinning up with proxy: ${proxy.split(':')[0]}:${proxy.split(':')[1]} | ${urlQueue.length} URLs in queue`);
 
   let profileId = null;
   let browser = null;
@@ -350,13 +352,13 @@ async function downloadBatch(urls, proxy, batchIndex, totalBatches) {
     // Give proxy time to fully authenticate
     await sleep(2000);
 
-    let successCount = 0;
-    let failCount = 0;
+    let profileSuccess = 0;
 
-    // Process each URL in the batch
-    for (let i = 0; i < urls.length; i++) {
-      const url = urls[i];
-      console.log(`\n  [${i + 1}/${urls.length}] Processing: ${url}`);
+    while (urlQueue.length > 0) {
+      const url = urlQueue.shift();
+      if (!url) break;
+
+      console.log(`\n  [Profile ${profileLabel}] [${urlQueue.length} left in queue] Processing: ${url}`);
 
       try {
         // Step 1: Navigate to the page
@@ -405,45 +407,28 @@ async function downloadBatch(urls, proxy, batchIndex, totalBatches) {
 
         // Mark as successful only after verified completion
         await saveSuccessfulUrl(url);
-        successCount++;
+        profileSuccess++;
+        results.successful++;
 
-        // Step 5: Random delay between 2-3 seconds before next download
-        const randomDelay = 2000 + Math.random() * 1000; // 2-3 seconds
+        // Random delay between 2-3 seconds before next download
+        const randomDelay = 2000 + Math.random() * 1000;
         console.log(`    ⏳ Waiting ${(randomDelay / 1000).toFixed(1)}s before next download...`);
         await sleep(randomDelay);
 
       } catch (error) {
         console.log(`    ❌ Failed: ${error.message}`);
-        failCount++;
-
-        // Abort the rest of the batch and let the finally block tear down
-        // the profile. The worker will then pick up the next batch with a
-        // fresh profile and a different proxy. Rationale: the most common
-        // failure here is Freepik's "upgrade to plan" modal, which means
-        // this proxy/profile has been flagged for the paywall — burning
-        // more clicks on it just wastes time. Untouched URLs stay out of
-        // successful_urls.txt and get retried on the next run.
-        const skipped = urls.length - (i + 1);
-        if (skipped > 0) {
-          console.log(`    🔄 Aborting batch — ${skipped} URL(s) will retry with a fresh profile`);
-        }
+        results.failed++;
+        console.log(`    🔄 Profile paywalled — closing and rotating proxy. URL will be retried on next script run.`);
         break;
       }
     }
 
-    console.log(`\n  📊 Batch ended: ${successCount} succeeded, ${failCount} failed`);
-
-    // Delay after batch if configured
-    if (CONFIG.BATCH_DELAY > 0) {
-      console.log(`  ⏳ Waiting ${CONFIG.BATCH_DELAY}s before next batch...`);
-      await sleep(CONFIG.BATCH_DELAY * 1000);
-    }
-
-    return { success: true, successCount, failCount };
+    console.log(`\n  📊 Profile ${profileLabel} ended: ${profileSuccess} download(s) before rotation`);
+    return { profileSuccess };
 
   } catch (error) {
-    console.log(`  ❌ Browser error: ${error.message}`);
-    return { success: false, error: error.message };
+    console.log(`  ❌ Profile error: ${error.message}`);
+    return { profileSuccess: 0, error: error.message };
 
   } finally {
     // Cleanup
@@ -487,29 +472,27 @@ async function downloadBatch(urls, proxy, batchIndex, totalBatches) {
   }
 }
 
-// Worker function for parallel processing
-async function worker(workerId, urlBatches, proxies, results) {
+// Worker function for parallel processing. Each worker repeatedly spins up
+// a profile, drains as much of the shared queue as that profile can handle
+// before getting paywalled, then rotates to a fresh profile/proxy.
+async function worker(workerId, urlQueue, proxies, results) {
   console.log(`\n🚀 Worker ${workerId + 1} started`);
+  let profileNum = 0;
 
-  while (urlBatches.length > 0) {
-    const batch = urlBatches.shift();
-    if (!batch) break;
-
-    const batchIndex = results.processed;
+  while (urlQueue.length > 0) {
+    profileNum++;
     const proxy = proxies[Math.floor(Math.random() * proxies.length)];
+    const profileLabel = `${workerId + 1}.${profileNum}`;
 
-    const result = await downloadBatch(batch.urls, proxy, batchIndex, results.total);
+    await downloadWithProfile(urlQueue, proxy, profileLabel, results);
 
-    results.processed++;
-    if (result.success) {
-      results.successful += result.successCount;
-      results.failed += result.failCount;
-    } else {
-      results.failed += batch.urls.length;
+    const done = results.successful + results.failed;
+    console.log(`\n📊 Overall Progress: ${done}/${results.total} | ✅ ${results.successful} | ❌ ${results.failed} | 📋 ${urlQueue.length} left in queue`);
+
+    if (CONFIG.BATCH_DELAY > 0 && urlQueue.length > 0) {
+      console.log(`  ⏳ Waiting ${CONFIG.BATCH_DELAY}s before next profile...`);
+      await sleep(CONFIG.BATCH_DELAY * 1000);
     }
-
-    // Show progress
-    console.log(`\n📊 Overall Progress: ${results.processed}/${results.total} batches | ✅ ${results.successful} | ❌ ${results.failed}`);
   }
 
   console.log(`\n✋ Worker ${workerId + 1} finished`);
@@ -542,8 +525,7 @@ async function main() {
 
   console.log('⚙️  Configuration:');
   console.log(`   • Threads: ${CONFIG.THREADS}`);
-  console.log(`   • Batch size: ${CONFIG.BATCH_SIZE} URLs per browser`);
-  console.log(`   • Batch delay: ${CONFIG.BATCH_DELAY}s`);
+  console.log(`   • Profile rotation delay: ${CONFIG.BATCH_DELAY}s`);
   console.log(`   • Images directory: ${CONFIG.IMAGES_DIR}`);
   console.log(`   • Multilogin port: ${CONFIG.MULTILOGIN_PORT}\n`);
 
@@ -591,16 +573,11 @@ async function main() {
 
   console.log(`📋 URLs to process: ${urls.length} (${allUrls.length - urls.length} skipped)\n`);
 
-  // Split URLs into batches
-  const batches = [];
-  for (let i = 0; i < urls.length; i += CONFIG.BATCH_SIZE) {
-    batches.push({
-      urls: urls.slice(i, i + CONFIG.BATCH_SIZE),
-      index: batches.length,
-    });
-  }
+  // Build a single shared queue. Workers pull URLs one at a time, keeping
+  // their profile alive until it gets paywalled, then rotating to a new one.
+  const urlQueue = [...urls];
 
-  console.log(`📦 Created ${batches.length} batches of up to ${CONFIG.BATCH_SIZE} URLs each\n`);
+  console.log(`📦 Queue ready: ${urlQueue.length} URLs to process\n`);
 
   // Start processing
   console.log('='.repeat(60));
@@ -609,16 +586,15 @@ async function main() {
 
   const startTime = Date.now();
   const results = {
-    total: batches.length,
-    processed: 0,
+    total: urlQueue.length,
     successful: 0,
     failed: 0,
   };
 
-  // Create workers
+  // Create workers — they all share the same urlQueue.
   const workers = [];
   for (let i = 0; i < CONFIG.THREADS; i++) {
-    workers.push(worker(i, [...batches], proxies, results));
+    workers.push(worker(i, urlQueue, proxies, results));
   }
 
   await Promise.all(workers);
@@ -629,7 +605,7 @@ async function main() {
   console.log('\n' + '='.repeat(60));
   console.log('📋 FINAL SUMMARY');
   console.log('='.repeat(60));
-  console.log(`📦 Total batches: ${results.total}`);
+  console.log(`📋 Total URLs: ${results.total}`);
   console.log(`✅ Successful downloads: ${results.successful}`);
   console.log(`❌ Failed downloads: ${results.failed}`);
   console.log(`⏱️  Total duration: ${duration}s`);

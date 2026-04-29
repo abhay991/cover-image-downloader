@@ -21,6 +21,15 @@ const CONFIG = {
   MULTILOGIN_PORT: parseInt(process.env.MULTILOGIN_PORT || '35000'), // Multilogin local API port
   PROFILE_FOLDER_ID: '', // Your Multilogin folder ID (optional)
 
+  // Proxy source: 'file' loads from proxies.txt, 'multilogin' generates per profile via Multilogin's proxy API
+  PROXY_SOURCE: (process.env.PROXY_SOURCE || 'file').toLowerCase(),
+  MULTILOGIN_PROXY_COUNTRY: process.env.MULTILOGIN_PROXY_COUNTRY || 'us',
+  MULTILOGIN_PROXY_REGION: process.env.MULTILOGIN_PROXY_REGION || '',
+  MULTILOGIN_PROXY_CITY: process.env.MULTILOGIN_PROXY_CITY || '',
+  MULTILOGIN_PROXY_PROTOCOL: process.env.MULTILOGIN_PROXY_PROTOCOL || 'http',
+  MULTILOGIN_PROXY_SESSION_TYPE: process.env.MULTILOGIN_PROXY_SESSION_TYPE || 'sticky',
+  MULTILOGIN_PROXY_IPTTL: parseInt(process.env.MULTILOGIN_PROXY_IPTTL || '0'),
+
   // Browser settings
   BROWSER_TIMEOUT: 60000,
   PAGE_LOAD_TIMEOUT: 30000,
@@ -82,21 +91,129 @@ function getMultiloginHeaders() {
   return headers;
 }
 
-// Create Multilogin quick profile with proxy
-async function createQuickProfile(proxy) {
-  const parts = proxy.split(':');
+// Parse a proxy entry. Supports:
+//   host:port:username:password           (legacy, http with auth)
+//   host:port                             (http, no auth)
+//   scheme://host:port                    (scheme = http|https|socks4|socks5)
+//   scheme://username:password@host:port
+const PROXY_SCHEMES = ['http', 'https', 'socks4', 'socks5'];
 
-  if (parts.length !== 4) {
-    throw new Error(`Invalid proxy format. Expected host:port:username:password, got: ${proxy}`);
+function parseProxy(raw) {
+  const trimmed = raw.trim();
+
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) {
+    let u;
+    try {
+      u = new URL(trimmed);
+    } catch (e) {
+      throw new Error(`Invalid proxy URL: ${trimmed} (${e.message})`);
+    }
+    const type = u.protocol.replace(':', '').toLowerCase();
+    if (!PROXY_SCHEMES.includes(type)) {
+      throw new Error(`Unsupported proxy scheme "${type}" in: ${trimmed}`);
+    }
+    if (!u.hostname || !u.port) {
+      throw new Error(`Proxy URL missing host or port: ${trimmed}`);
+    }
+    return {
+      type,
+      host: u.hostname,
+      port: parseInt(u.port),
+      username: decodeURIComponent(u.username || ''),
+      password: decodeURIComponent(u.password || ''),
+    };
   }
 
-  const [host, port, username, password] = parts;
+  const parts = trimmed.split(':');
+  if (parts.length === 2) {
+    const [host, port] = parts;
+    return { type: 'http', host: host.trim(), port: parseInt(port), username: '', password: '' };
+  }
+  if (parts.length === 4) {
+    const [host, port, username, password] = parts;
+    return {
+      type: 'http',
+      host: host.trim(),
+      port: parseInt(port),
+      username: username.trim(),
+      password: password.trim(),
+    };
+  }
+  throw new Error(`Invalid proxy format. Expected scheme://host:port, scheme://user:pass@host:port, host:port, or host:port:user:pass — got: ${trimmed}`);
+}
 
-  console.log(`  → Proxy: ${host}:${port} (user: ${username.substring(0, 3)}***)`);
+function describeProxy(proxy) {
+  const { type, host, port, username } = parseProxy(proxy);
+  const userPart = username ? ` (user: ${username.substring(0, 3)}***)` : '';
+  return `${type}://${host}:${port}${userPart}`;
+}
 
-  // Ensure no whitespace in credentials
-  const cleanUsername = username.trim();
-  const cleanPassword = password.trim();
+// Pull a proxy URL out of Multilogin's response, which may use one of several
+// shapes. Returns null if nothing matched so the caller can log the raw body.
+function extractGeneratedProxyUrl(result) {
+  if (!result) return null;
+  if (typeof result === 'string') return result;
+  if (typeof result.connection_url === 'string') return result.connection_url;
+  if (Array.isArray(result.connection_urls) && result.connection_urls.length) {
+    return result.connection_urls[0];
+  }
+  if (Array.isArray(result.proxies) && result.proxies.length) {
+    const p = result.proxies[0];
+    return typeof p === 'string' ? p : (p && (p.connection_url || p.url)) || null;
+  }
+  if (result.data) {
+    return extractGeneratedProxyUrl(result.data);
+  }
+  if (Array.isArray(result) && result.length) {
+    return extractGeneratedProxyUrl(result[0]);
+  }
+  return null;
+}
+
+// Generate a fresh proxy via Multilogin's proxy service.
+// Endpoint: POST https://profile-proxy.multilogin.com/v1/proxy/connection_url
+async function generateMultiloginProxy() {
+  const body = {
+    country: CONFIG.MULTILOGIN_PROXY_COUNTRY,
+    sessionType: CONFIG.MULTILOGIN_PROXY_SESSION_TYPE,
+    protocol: CONFIG.MULTILOGIN_PROXY_PROTOCOL,
+    IPTTL: CONFIG.MULTILOGIN_PROXY_IPTTL,
+    count: 1,
+  };
+  if (CONFIG.MULTILOGIN_PROXY_REGION) body.region = CONFIG.MULTILOGIN_PROXY_REGION;
+  if (CONFIG.MULTILOGIN_PROXY_CITY) body.city = CONFIG.MULTILOGIN_PROXY_CITY;
+
+  const response = await fetch('https://profile-proxy.multilogin.com/v1/proxy/connection_url', {
+    method: 'POST',
+    headers: getMultiloginHeaders(),
+    body: JSON.stringify(body),
+  });
+
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`Multilogin proxy generation failed (${response.status}): ${text}`);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error(`Multilogin proxy response was not JSON: ${text}`);
+  }
+
+  const url = extractGeneratedProxyUrl(parsed);
+  if (!url) {
+    throw new Error(`Could not extract proxy URL from Multilogin response: ${text}`);
+  }
+  return url;
+}
+
+// Create Multilogin quick profile with proxy
+async function createQuickProfile(proxy) {
+  const { type, host, port, username, password } = parseProxy(proxy);
+
+  const userDisplay = username ? ` (user: ${username.substring(0, 3)}***)` : '';
+  console.log(`  → Proxy: ${type}://${host}:${port}${userDisplay}`);
 
   const profileData = {
     browser_type: 'mimic',
@@ -107,11 +224,11 @@ async function createQuickProfile(proxy) {
         proxy_masking: 'custom'
       },
       proxy: {
-        type: 'http',
-        host: host.trim(),
-        port: parseInt(port),
-        username: cleanUsername,
-        password: cleanPassword
+        type,
+        host,
+        port,
+        username,
+        password
       }
     }
   };
@@ -301,7 +418,7 @@ async function trackDiskDownload(downloadDir, {
 // successful_urls.txt and will be retried the next time the script runs.
 async function downloadWithProfile(urlQueue, proxy, profileLabel, results) {
   const timestamp = new Date().toISOString().split('T')[1].split('.')[0];
-  console.log(`\n[${timestamp}] [Profile ${profileLabel}] Spinning up with proxy: ${proxy.split(':')[0]}:${proxy.split(':')[1]} | ${urlQueue.length} URLs in queue`);
+  console.log(`\n[${timestamp}] [Profile ${profileLabel}] Spinning up with proxy: ${describeProxy(proxy)} | ${urlQueue.length} URLs in queue`);
 
   let profileId = null;
   let browser = null;
@@ -487,8 +604,21 @@ async function worker(workerId, urlQueue, proxies, results) {
 
   while (urlQueue.length > 0) {
     profileNum++;
-    const proxy = proxies[Math.floor(Math.random() * proxies.length)];
     const profileLabel = `${workerId + 1}.${profileNum}`;
+
+    let proxy;
+    if (CONFIG.PROXY_SOURCE === 'multilogin') {
+      try {
+        proxy = await generateMultiloginProxy();
+      } catch (e) {
+        console.error(`❌ [Profile ${profileLabel}] Failed to generate Multilogin proxy: ${e.message}`);
+        console.error(`  → Skipping this profile spin-up; will retry on next iteration.`);
+        await sleep(5000);
+        continue;
+      }
+    } else {
+      proxy = proxies[Math.floor(Math.random() * proxies.length)];
+    }
 
     await downloadWithProfile(urlQueue, proxy, profileLabel, results);
 
@@ -534,7 +664,8 @@ async function main() {
   console.log(`   • Profile rotation delay: ${CONFIG.PROFILE_ROTATION_DELAY}s`);
   console.log(`   • Max URLs per profile: ${CONFIG.MAX_URLS_PER_PROFILE || 'unlimited'}`);
   console.log(`   • Images directory: ${CONFIG.IMAGES_DIR}`);
-  console.log(`   • Multilogin port: ${CONFIG.MULTILOGIN_PORT}\n`);
+  console.log(`   • Multilogin port: ${CONFIG.MULTILOGIN_PORT}`);
+  console.log(`   • Proxy source: ${CONFIG.PROXY_SOURCE}${CONFIG.PROXY_SOURCE === 'multilogin' ? ` (${CONFIG.MULTILOGIN_PROXY_PROTOCOL}, ${CONFIG.MULTILOGIN_PROXY_COUNTRY}${CONFIG.MULTILOGIN_PROXY_REGION ? '/' + CONFIG.MULTILOGIN_PROXY_REGION : ''}${CONFIG.MULTILOGIN_PROXY_CITY ? '/' + CONFIG.MULTILOGIN_PROXY_CITY : ''}, ${CONFIG.MULTILOGIN_PROXY_SESSION_TYPE})` : ''}\n`);
 
   // Check Multilogin connection
   const isConnected = await checkMultiloginConnection();
@@ -552,22 +683,27 @@ async function main() {
     await fs.mkdir(CONFIG.IMAGES_DIR, { recursive: true });
   }
 
-  // Load URLs and proxies
+  // Load URLs (and proxies, if using file mode)
   console.log('\n📂 Loading files...');
   const [allUrls, successfulUrls, proxiesContent] = await Promise.all([
     loadUrls(CONFIG.URLS_FILE),
     loadSuccessfulUrls(),
-    fs.readFile('proxies.txt', 'utf-8').catch(() => ''),
+    CONFIG.PROXY_SOURCE === 'file'
+      ? fs.readFile('proxies.txt', 'utf-8').catch(() => '')
+      : Promise.resolve(''),
   ]);
 
-  const proxies = proxiesContent.split('\n').map(line => line.trim()).filter(Boolean);
-
-  if (proxies.length === 0) {
-    console.error('❌ No proxies found in proxies.txt!');
-    return;
+  let proxies = [];
+  if (CONFIG.PROXY_SOURCE === 'file') {
+    proxies = proxiesContent.split('\n').map(line => line.trim()).filter(Boolean);
+    if (proxies.length === 0) {
+      console.error('❌ No proxies found in proxies.txt!');
+      return;
+    }
+    console.log(`✓ Loaded ${allUrls.length} URLs, ${proxies.length} proxies`);
+  } else {
+    console.log(`✓ Loaded ${allUrls.length} URLs (proxies generated on-demand via Multilogin)`);
   }
-
-  console.log(`✓ Loaded ${allUrls.length} URLs, ${proxies.length} proxies`);
   console.log(`✓ Found ${successfulUrls.size} already processed URLs\n`);
 
   // Filter out already processed URLs

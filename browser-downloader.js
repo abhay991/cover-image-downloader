@@ -13,7 +13,7 @@ const CONFIG = {
   URLS_FILE: 'urls.json',
   SUCCESS_LOG: 'successful_urls.txt',
   IMAGES_DIR: 'images',
-  BATCH_DELAY: parseInt(process.env.BATCH_DELAY || '5'), // Delay in seconds between profile rotations
+  PROFILE_ROTATION_DELAY: parseInt(process.env.PROFILE_ROTATION_DELAY || '5'), // Seconds to wait after closing one profile before opening the next
   MAX_URLS_PER_PROFILE: parseInt(process.env.MAX_URLS_PER_PROFILE || '0'), // Force-rotate after N successful downloads (0 = no cap)
 
   // Multilogin configuration
@@ -495,9 +495,9 @@ async function worker(workerId, urlQueue, proxies, results) {
     const done = results.successful + results.failed;
     console.log(`\n📊 Overall Progress: ${done}/${results.total} | ✅ ${results.successful} | ❌ ${results.failed} | 📋 ${urlQueue.length} left in queue`);
 
-    if (CONFIG.BATCH_DELAY > 0 && urlQueue.length > 0) {
-      console.log(`  ⏳ Waiting ${CONFIG.BATCH_DELAY}s before next profile...`);
-      await sleep(CONFIG.BATCH_DELAY * 1000);
+    if (CONFIG.PROFILE_ROTATION_DELAY > 0 && urlQueue.length > 0) {
+      console.log(`  ⏳ Waiting ${CONFIG.PROFILE_ROTATION_DELAY}s before next profile...`);
+      await sleep(CONFIG.PROFILE_ROTATION_DELAY * 1000);
     }
   }
 
@@ -531,7 +531,7 @@ async function main() {
 
   console.log('⚙️  Configuration:');
   console.log(`   • Threads: ${CONFIG.THREADS}`);
-  console.log(`   • Profile rotation delay: ${CONFIG.BATCH_DELAY}s`);
+  console.log(`   • Profile rotation delay: ${CONFIG.PROFILE_ROTATION_DELAY}s`);
   console.log(`   • Max URLs per profile: ${CONFIG.MAX_URLS_PER_PROFILE || 'unlimited'}`);
   console.log(`   • Images directory: ${CONFIG.IMAGES_DIR}`);
   console.log(`   • Multilogin port: ${CONFIG.MULTILOGIN_PORT}\n`);

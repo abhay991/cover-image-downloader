@@ -29,6 +29,7 @@ const CONFIG = {
   MULTILOGIN_PROXY_PROTOCOL: process.env.MULTILOGIN_PROXY_PROTOCOL || 'http',
   MULTILOGIN_PROXY_SESSION_TYPE: process.env.MULTILOGIN_PROXY_SESSION_TYPE || 'sticky',
   MULTILOGIN_PROXY_IPTTL: parseInt(process.env.MULTILOGIN_PROXY_IPTTL || '0'),
+  MULTILOGIN_PROXY_MASKING: process.env.MULTILOGIN_PROXY_MASKING || 'custom', // 'custom' or 'built_in' — try 'built_in' if profile API rejects generated proxies
 
   // Browser settings
   BROWSER_TIMEOUT: 60000,
@@ -205,6 +206,8 @@ async function generateMultiloginProxy() {
   if (!url) {
     throw new Error(`Could not extract proxy URL from Multilogin response: ${text}`);
   }
+  const masked = url.replace(/\/\/[^@]+@/, '//***:***@');
+  console.log(`  🌐 Generated proxy: ${masked}`);
   return url;
 }
 
@@ -221,7 +224,7 @@ async function createQuickProfile(proxy) {
     automation: 'puppeteer',
     parameters: {
       flags: {
-        proxy_masking: 'custom'
+        proxy_masking: CONFIG.PROXY_SOURCE === 'multilogin' ? CONFIG.MULTILOGIN_PROXY_MASKING : 'custom'
       },
       proxy: {
         type,

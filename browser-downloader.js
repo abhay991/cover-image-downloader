@@ -14,6 +14,7 @@ const CONFIG = {
   SUCCESS_LOG: 'successful_urls.txt',
   IMAGES_DIR: 'images',
   BATCH_DELAY: parseInt(process.env.BATCH_DELAY || '5'), // Delay in seconds between profile rotations
+  MAX_URLS_PER_PROFILE: parseInt(process.env.MAX_URLS_PER_PROFILE || '0'), // Force-rotate after N successful downloads (0 = no cap)
 
   // Multilogin configuration
   MULTILOGIN_API_KEY: process.env.MULTILOGIN_API_KEY || '', // Your Multilogin API key from .env
@@ -410,6 +411,11 @@ async function downloadWithProfile(urlQueue, proxy, profileLabel, results) {
         profileSuccess++;
         results.successful++;
 
+        if (CONFIG.MAX_URLS_PER_PROFILE > 0 && profileSuccess >= CONFIG.MAX_URLS_PER_PROFILE) {
+          console.log(`    🔁 Hit MAX_URLS_PER_PROFILE (${CONFIG.MAX_URLS_PER_PROFILE}) — rotating proactively`);
+          break;
+        }
+
         // Random delay between 2-3 seconds before next download
         const randomDelay = 2000 + Math.random() * 1000;
         console.log(`    ⏳ Waiting ${(randomDelay / 1000).toFixed(1)}s before next download...`);
@@ -526,6 +532,7 @@ async function main() {
   console.log('⚙️  Configuration:');
   console.log(`   • Threads: ${CONFIG.THREADS}`);
   console.log(`   • Profile rotation delay: ${CONFIG.BATCH_DELAY}s`);
+  console.log(`   • Max URLs per profile: ${CONFIG.MAX_URLS_PER_PROFILE || 'unlimited'}`);
   console.log(`   • Images directory: ${CONFIG.IMAGES_DIR}`);
   console.log(`   • Multilogin port: ${CONFIG.MULTILOGIN_PORT}\n`);
 
